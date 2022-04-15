@@ -3,13 +3,9 @@
 """
 
 import torch
-import torch.nn.functional as F
-import kornia
-from kornia.geometry.camera import pixel2cam
 import numpy as np
 from typing import List
 import nvdiffrast.torch as dr
-from scipy.io import loadmat
 from torch import nn
 
 def ndc_projection(x=0.1, n=1.0, f=50.0):
@@ -20,9 +16,10 @@ def ndc_projection(x=0.1, n=1.0, f=50.0):
 
 class MeshRenderer(nn.Module):
     def __init__(self,
-                rasterize_fov,
-                znear=0.1,
-                zfar=10, 
+                device,
+                rasterize_fov=2 * np.arctan(112. / 1015.) * 180 / np.pi,
+                znear=5,
+                zfar=15, 
                 rasterize_size=224):
         super(MeshRenderer, self).__init__()
 
@@ -31,6 +28,7 @@ class MeshRenderer(nn.Module):
                 torch.diag(torch.tensor([1., -1, -1, 1])))
         self.rasterize_size = rasterize_size
         self.glctx = None
+        self.device = device
     
     def forward(self, vertex, tri, feat=None):
         """
@@ -44,24 +42,24 @@ class MeshRenderer(nn.Module):
             tri             -- torch.tensor, size (B, M, 3) or (M, 3), triangles
             feat(optional)  -- torch.tensor, size (B, C), features
         """
-        device = vertex.device
+        # device = vertex.device
         rsize = int(self.rasterize_size)
-        ndc_proj = self.ndc_proj.to(device)
+        ndc_proj = self.ndc_proj.to(self.device)
         # trans to homogeneous coordinates of 3d vertices, the direction of y is the same as v
         if vertex.shape[-1] == 3:
-            vertex = torch.cat([vertex, torch.ones([*vertex.shape[:2], 1]).to(device)], dim=-1)
+            vertex = torch.cat([vertex, torch.ones([*vertex.shape[:2], 1]).to(self.device)], dim=-1)
             vertex[..., 1] = -vertex[..., 1] 
 
 
         vertex_ndc = vertex @ ndc_proj.t()
         if self.glctx is None:
-            self.glctx = dr.RasterizeGLContext(device=device)
-            print("create glctx on device cuda:%d"%device.index)
+            self.glctx = dr.RasterizeGLContext(device=self.device)
+            print("create glctx on device cuda:%d"%self.device.index)
         
         ranges = None
         if isinstance(tri, List) or len(tri.shape) == 3:
             vum = vertex_ndc.shape[1]
-            fnum = torch.tensor([f.shape[0] for f in tri]).unsqueeze(1).to(device) 
+            fnum = torch.tensor([f.shape[0] for f in tri]).unsqueeze(1).to(self.device) 
             fstartidx = torch.cumsum(fnum, dim=0) - fnum 
             ranges = torch.cat([fstartidx, fnum], axis=1).type(torch.int32).cpu()
             for i in range(tri.shape[0]):
@@ -83,7 +81,7 @@ class MeshRenderer(nn.Module):
         if feat is not None:
             image, _ = dr.interpolate(feat, rast_out, tri)
             image = image.permute(0, 3, 1, 2)
-            image = mask * image
+            image = (mask * image).clamp(0, 1)
         
         return mask, depth, image
 

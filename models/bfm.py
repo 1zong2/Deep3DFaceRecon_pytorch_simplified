@@ -25,7 +25,7 @@ class SH:
 
 class ParametricFaceModel:
     def __init__(self, 
-                bfm_folder='./BFM', 
+                bfm_folder='BFM', 
                 recenter=True,
                 camera_distance=10.,
                 init_lit=np.array([
@@ -33,7 +33,8 @@ class ParametricFaceModel:
                     ]),
                 focal=1015.,
                 center=112.,
-                is_train=True,
+                is_train=False,
+                device='cuda',
                 default_name='BFM_model_front.mat'):
         
         if not os.path.isfile(os.path.join(bfm_folder, default_name)):
@@ -43,16 +44,22 @@ class ParametricFaceModel:
         self.mean_shape = model['meanshape'].astype(np.float32)
         # identity basis. [3*N,80]
         self.id_base = model['idBase'].astype(np.float32)
+        self.id_base = torch.from_numpy(self.id_base).to(device)
         # expression basis. [3*N,64]
         self.exp_base = model['exBase'].astype(np.float32)
+        self.exp_base = torch.from_numpy(self.exp_base).to(device)
         # mean face texture. [3*N,1] (0-255)
         self.mean_tex = model['meantex'].astype(np.float32)
+        self.mean_tex = torch.from_numpy(self.mean_tex).to(device)
         # texture basis. [3*N,80]
         self.tex_base = model['texBase'].astype(np.float32)
+        self.tex_base = torch.from_numpy(self.tex_base).to(device)
         # face indices for each vertex that lies in. starts from 0. [N,8]
         self.point_buf = model['point_buf'].astype(np.int64) - 1
+        self.point_buf = torch.from_numpy(self.point_buf).to(device)
         # vertex indices for each face. starts from 0. [F,3]
         self.face_buf = model['tri'].astype(np.int64) - 1
+        self.face_buf = torch.from_numpy(self.face_buf).to(device)
         # vertex indices for 68 landmarks. starts from 0. [68,1]
         self.keypoints = np.squeeze(model['keypoints']).astype(np.int64) - 1
 
@@ -68,12 +75,14 @@ class ParametricFaceModel:
             mean_shape = self.mean_shape.reshape([-1, 3])
             mean_shape = mean_shape - np.mean(mean_shape, axis=0, keepdims=True)
             self.mean_shape = mean_shape.reshape([-1, 1])
+        self.mean_shape = torch.from_numpy(self.mean_shape.reshape([1, -1])).to(device)
 
-        self.persc_proj = perspective_projection(focal, center)
-        self.device = 'cpu'
+        self.device = device        
+        self.persc_proj = torch.from_numpy(perspective_projection(focal, center)).to(device)
         self.camera_distance = camera_distance
         self.SH = SH()
         self.init_lit = init_lit.reshape([1, 1, -1]).astype(np.float32)
+        self.init_lit = torch.from_numpy(self.init_lit).to(device)
         
 
     def to(self, device):
@@ -95,7 +104,8 @@ class ParametricFaceModel:
         batch_size = id_coeff.shape[0]
         id_part = torch.einsum('ij,aj->ai', self.id_base, id_coeff)
         exp_part = torch.einsum('ij,aj->ai', self.exp_base, exp_coeff)
-        face_shape = id_part + exp_part + self.mean_shape.reshape([1, -1])
+        face_shape = id_part + exp_part + self.mean_shape
+        
         return face_shape.reshape([batch_size, -1, 3])
     
 
@@ -220,6 +230,8 @@ class ParametricFaceModel:
             face_shape       -- torch.tensor, size (B, N, 3)
         """
         # to image_plane
+        
+
         face_proj = face_shape @ self.persc_proj
         face_proj = face_proj[..., :2] / face_proj[..., 2:]
 
@@ -283,7 +295,6 @@ class ParametricFaceModel:
         coef_dict = self.split_coeff(coeffs)
         face_shape = self.compute_shape(coef_dict['id'], coef_dict['exp'])
         rotation = self.compute_rotation(coef_dict['angle'])
-
 
         face_shape_transformed = self.transform(face_shape, rotation, coef_dict['trans'])
         face_vertex = self.to_camera(face_shape_transformed)

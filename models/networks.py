@@ -1,127 +1,38 @@
-"""This script defines deep neural networks for Deep3DFaceRecon_pytorch
-"""
-
-import os
-import numpy as np
-import torch.nn.functional as F
-from torch.nn import init
-import functools
-from torch.optim import lr_scheduler
 import torch
 from torch import Tensor
 import torch.nn as nn
-try:
-    from torch.hub import load_state_dict_from_url
-except ImportError:
-    from torch.utils.model_zoo import load_url as load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
-from .arcface_torch.backbones import get_model
-from kornia.geometry import warp_affine
-
-def resize_n_crop(image, M, dsize=112):
-    # image: (b, c, h, w)
-    # M   :  (b, 2, 3)
-    return warp_affine(image, M, dsize=(dsize, dsize))
-
-def filter_state_dict(state_dict, remove_name='fc'):
-    new_state_dict = {}
-    for key in state_dict:
-        if remove_name in key:
-            continue
-        new_state_dict[key] = state_dict[key]
-    return new_state_dict
-
-def get_scheduler(optimizer, opt):
-    """Return a learning rate scheduler
-
-    Parameters:
-        optimizer          -- the optimizer of the network
-        opt (option class) -- stores all the experiment flags; needs to be a subclass of BaseOptions．　
-                              opt.lr_policy is the name of learning rate policy: linear | step | plateau | cosine
-
-    For other schedulers (step, plateau, and cosine), we use the default PyTorch schedulers.
-    See https://pytorch.org/docs/stable/optim.html for more details.
-    """
-    if opt.lr_policy == 'linear':
-        def lambda_rule(epoch):
-            lr_l = 1.0 - max(0, epoch + opt.epoch_count - opt.n_epochs) / float(opt.n_epochs + 1)
-            return lr_l
-        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_rule)
-    elif opt.lr_policy == 'step':
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=opt.lr_decay_epochs, gamma=0.2)
-    elif opt.lr_policy == 'plateau':
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, threshold=0.01, patience=5)
-    elif opt.lr_policy == 'cosine':
-        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=opt.n_epochs, eta_min=0)
-    else:
-        return NotImplementedError('learning rate policy [%s] is not implemented', opt.lr_policy)
-    return scheduler
 
 
-def define_net_recon(net_recon, use_last_fc=False, init_path=None):
-    return ReconNetWrapper(net_recon, use_last_fc=use_last_fc, init_path=init_path)
+class ReconNet(nn.Module):
+    def __init__(self):
+        super(ReconNet, self).__init__()
 
-def define_net_recog(net_recog, pretrained_path=None):
-    net = RecogNetWrapper(net_recog=net_recog, pretrained_path=pretrained_path)
-    net.eval()
-    return net
+        self.backbone = ResNet(block = Bottleneck, layers = [3, 4, 6, 3], num_classes=257)
 
-class ReconNetWrapper(nn.Module):
-    fc_dim=257
-    def __init__(self, net_recon, use_last_fc=False, init_path=None):
-        super(ReconNetWrapper, self).__init__()
-        self.use_last_fc = use_last_fc
-        if net_recon not in func_dict:
-            return  NotImplementedError('network [%s] is not implemented', net_recon)
-        func, last_dim = func_dict[net_recon]
-        backbone = func(use_last_fc=use_last_fc, num_classes=self.fc_dim)
-        if init_path and os.path.isfile(init_path):
-            state_dict = filter_state_dict(torch.load(init_path, map_location='cpu'))
-            backbone.load_state_dict(state_dict)
-            print("loading init net_recon %s from %s" %(net_recon, init_path))
-        self.backbone = backbone
-        if not use_last_fc:
-            self.final_layers = nn.ModuleList([
-                conv1x1(last_dim, 80, bias=True), # id layer
-                conv1x1(last_dim, 64, bias=True), # exp layer
-                conv1x1(last_dim, 80, bias=True), # tex layer
-                conv1x1(last_dim, 3, bias=True),  # angle layer
-                conv1x1(last_dim, 27, bias=True), # gamma layer
-                conv1x1(last_dim, 2, bias=True),  # tx, ty
-                conv1x1(last_dim, 1, bias=True)   # tz
-            ])
-            for m in self.final_layers:
-                nn.init.constant_(m.weight, 0.)
-                nn.init.constant_(m.bias, 0.)
+        self.final_layers = nn.ModuleList([
+            conv1x1(2048, 80, bias=True), # id layer
+            conv1x1(2048, 64, bias=True), # exp layer
+            conv1x1(2048, 80, bias=True), # tex layer
+            conv1x1(2048, 3, bias=True),  # angle layer
+            conv1x1(2048, 27, bias=True), # gamma layer
+            conv1x1(2048, 2, bias=True),  # tx, ty
+            conv1x1(2048, 1, bias=True)   # tz
+        ])
+
+        for m in self.final_layers:
+            nn.init.constant_(m.weight, 0.)
+            nn.init.constant_(m.bias, 0.)
 
     def forward(self, x):
+
         x = self.backbone(x)
-        if not self.use_last_fc:
-            output = []
-            for layer in self.final_layers:
-                output.append(layer(x))
-            x = torch.flatten(torch.cat(output, dim=1), 1)
+        output = []
+        for layer in self.final_layers:
+            output.append(layer(x))
+        x = torch.flatten(torch.cat(output, dim=1), 1)
+
         return x
-
-
-class RecogNetWrapper(nn.Module):
-    def __init__(self, net_recog, pretrained_path=None, input_size=112):
-        super(RecogNetWrapper, self).__init__()
-        net = get_model(name=net_recog, fp16=False)
-        if pretrained_path:
-            state_dict = torch.load(pretrained_path, map_location='cpu')
-            net.load_state_dict(state_dict)
-            print("loading pretrained net_recog %s from %s" %(net_recog, pretrained_path))
-        for param in net.parameters():
-            param.requires_grad = False
-        self.net = net
-        self.preprocess = lambda x: 2 * x - 1
-        self.input_size=input_size
-        
-    def forward(self, image, M):
-        image = self.preprocess(resize_n_crop(image, M, self.input_size))
-        id_feature = F.normalize(self.net(image), dim=-1, p=2)
-        return id_feature
 
 
 # adapted from https://github.com/pytorch/vision/edit/master/torchvision/models/resnet.py
@@ -373,149 +284,3 @@ class ResNet(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self._forward_impl(x)
-
-
-def _resnet(
-    arch: str,
-    block: Type[Union[BasicBlock, Bottleneck]],
-    layers: List[int],
-    pretrained: bool,
-    progress: bool,
-    **kwargs: Any
-) -> ResNet:
-    model = ResNet(block, layers, **kwargs)
-    if pretrained:
-        state_dict = load_state_dict_from_url(model_urls[arch],
-                                              progress=progress)
-        model.load_state_dict(state_dict)
-    return model
-
-
-def resnet18(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""ResNet-18 model from
-    `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, progress,
-                   **kwargs)
-
-
-def resnet34(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""ResNet-34 model from
-    `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    return _resnet('resnet34', BasicBlock, [3, 4, 6, 3], pretrained, progress,
-                   **kwargs)
-
-
-def resnet50(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""ResNet-50 model from
-    `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    return _resnet('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress,
-                   **kwargs)
-
-
-def resnet101(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""ResNet-101 model from
-    `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    return _resnet('resnet101', Bottleneck, [3, 4, 23, 3], pretrained, progress,
-                   **kwargs)
-
-
-def resnet152(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""ResNet-152 model from
-    `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    return _resnet('resnet152', Bottleneck, [3, 8, 36, 3], pretrained, progress,
-                   **kwargs)
-
-
-def resnext50_32x4d(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""ResNeXt-50 32x4d model from
-    `"Aggregated Residual Transformation for Deep Neural Networks" <https://arxiv.org/pdf/1611.05431.pdf>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    kwargs['groups'] = 32
-    kwargs['width_per_group'] = 4
-    return _resnet('resnext50_32x4d', Bottleneck, [3, 4, 6, 3],
-                   pretrained, progress, **kwargs)
-
-
-def resnext101_32x8d(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""ResNeXt-101 32x8d model from
-    `"Aggregated Residual Transformation for Deep Neural Networks" <https://arxiv.org/pdf/1611.05431.pdf>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    kwargs['groups'] = 32
-    kwargs['width_per_group'] = 8
-    return _resnet('resnext101_32x8d', Bottleneck, [3, 4, 23, 3],
-                   pretrained, progress, **kwargs)
-
-
-def wide_resnet50_2(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""Wide ResNet-50-2 model from
-    `"Wide Residual Networks" <https://arxiv.org/pdf/1605.07146.pdf>`_.
-
-    The model is the same as ResNet except for the bottleneck number of channels
-    which is twice larger in every block. The number of channels in outer 1x1
-    convolutions is the same, e.g. last block in ResNet-50 has 2048-512-2048
-    channels, and in Wide ResNet-50-2 has 2048-1024-2048.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    kwargs['width_per_group'] = 64 * 2
-    return _resnet('wide_resnet50_2', Bottleneck, [3, 4, 6, 3],
-                   pretrained, progress, **kwargs)
-
-
-def wide_resnet101_2(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> ResNet:
-    r"""Wide ResNet-101-2 model from
-    `"Wide Residual Networks" <https://arxiv.org/pdf/1605.07146.pdf>`_.
-
-    The model is the same as ResNet except for the bottleneck number of channels
-    which is twice larger in every block. The number of channels in outer 1x1
-    convolutions is the same, e.g. last block in ResNet-50 has 2048-512-2048
-    channels, and in Wide ResNet-50-2 has 2048-1024-2048.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    kwargs['width_per_group'] = 64 * 2
-    return _resnet('wide_resnet101_2', Bottleneck, [3, 4, 23, 3],
-                   pretrained, progress, **kwargs)
-
-
-func_dict = {
-    'resnet18': (resnet18, 512),
-    'resnet50': (resnet50, 2048)
-}
