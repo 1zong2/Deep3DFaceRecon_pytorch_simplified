@@ -1,7 +1,7 @@
 # Description
 Simplified Version of Deep3DFaceRecon_pytorch
 
-# Get started
+# Getting started
 
 ## Download pretrained model
 download the BFM model and the face reconstruction model following this link
